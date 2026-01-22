@@ -17,12 +17,63 @@ BASE_DIR = Path(__file__).parent
 STORAGE_DIR = BASE_DIR / "storage"
 AGENTS_PATH = STORAGE_DIR / "agents.json"
 
-DEFAULT_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini")  # puedes cambiarlo
+DEFAULT_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini")
 DEFAULT_BUILDER_MODEL = os.getenv("OPENAI_BUILDER_MODEL", "gpt-4.1-mini")
 
 st.set_page_config(page_title=APP_TITLE, page_icon="🤖", layout="wide")
 
-client = OpenAI()
+
+# =========================
+# AUTH (Access Key Gate)
+# =========================
+def check_access() -> None:
+    """
+    Bloquea toda la app hasta que el usuario introduzca la clave correcta.
+    La clave se define en st.secrets["ACCESS_KEY"] (Streamlit Secrets).
+    """
+    if st.session_state.get("access_granted"):
+        return
+
+    access_key = st.secrets.get("ACCESS_KEY", "")
+    if not access_key:
+        st.error("Falta ACCESS_KEY en Streamlit Secrets.")
+        st.stop()
+
+    st.title("🔒 Acceso restringido")
+    st.write("Introduce la clave para acceder.")
+
+    key = st.text_input("Clave de acceso", type="password")
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        if st.button("Entrar", use_container_width=True):
+            if key == access_key:
+                st.session_state["access_granted"] = True
+                st.rerun()
+            else:
+                st.error("Clave incorrecta.")
+    with col2:
+        st.caption("Si no tienes la clave, contacta con el administrador.")
+
+    st.stop()
+
+
+# =========================
+# OPENAI CLIENT
+# =========================
+def get_openai_api_key() -> str:
+    return st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+
+
+def get_openai_client() -> OpenAI:
+    api_key = get_openai_api_key()
+    if not api_key:
+        st.error("Falta OPENAI_API_KEY. Añádela en Streamlit Secrets (recomendado).")
+        st.stop()
+    return OpenAI(api_key=api_key)
+
+
+client = get_openai_client()
 
 
 # =========================
@@ -38,9 +89,7 @@ def load_agents() -> List[Dict[str, Any]]:
     ensure_storage()
     try:
         data = json.loads(AGENTS_PATH.read_text(encoding="utf-8"))
-        if isinstance(data, list):
-            return data
-        return []
+        return data if isinstance(data, list) else []
     except Exception:
         return []
 
@@ -64,21 +113,17 @@ def upsert_agent(agent: Dict[str, Any]) -> None:
 # OPENAI HELPERS
 # =========================
 def call_responses(model: str, messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
-    """
-    Wrapper simple para la Responses API.
-    """
     resp = client.responses.create(
         model=model,
         input=messages,
         temperature=temperature,
     )
 
-    # "output_text" suele venir agregado
     text = getattr(resp, "output_text", None)
     if text:
         return text
 
-    # fallback por si cambia la estructura o viene vacío
+    # fallback
     try:
         parts = []
         for item in resp.output:
@@ -92,11 +137,6 @@ def call_responses(model: str, messages: List[Dict[str, str]], temperature: floa
 
 
 def extract_json(text: str) -> Optional[Dict[str, Any]]:
-    """
-    Intenta extraer un JSON "limpio" desde un texto.
-    Soporta respuestas con texto extra alrededor.
-    """
-    # 1) busca el primer bloque { ... } grande
     match = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if not match:
         return None
@@ -105,7 +145,6 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
     try:
         return json.loads(raw)
     except Exception:
-        # intento 2: limpia backticks
         raw2 = raw.strip("` \n")
         try:
             return json.loads(raw2)
@@ -177,10 +216,6 @@ Criterio de finalización:
 
 
 def builder_step(user_input: str) -> Dict[str, Any]:
-    """
-    Ejecuta un turno del builder IA, devolviendo el JSON interpretado.
-    """
-    # Incluimos el estado actual (draft) como contexto
     draft = st.session_state.get("agent_draft", {})
     builder_messages = st.session_state.get("builder_messages", [])
 
@@ -189,15 +224,13 @@ def builder_step(user_input: str) -> Dict[str, Any]:
         {"role": "user", "content": f"BORRADOR ACTUAL (JSON):\n{json.dumps(draft, ensure_ascii=False)}"},
     ]
 
-    # historial builder
-    messages.extend(builder_messages[-12:])  # limita contexto
+    messages.extend(builder_messages[-12:])
     messages.append({"role": "user", "content": user_input})
 
     raw = call_responses(model=DEFAULT_BUILDER_MODEL, messages=messages, temperature=0.4)
     data = extract_json(raw)
 
     if not data:
-        # fallback duro si el modelo se sale
         data = {
             "assistant_message": "Se me desordenó el formato. ¿Cómo quieres que se llame el agente y qué hace en una frase?",
             "draft_update": {},
@@ -205,18 +238,16 @@ def builder_step(user_input: str) -> Dict[str, Any]:
             "system_prompt": "",
         }
 
-    # guarda el intercambio en historial del builder
     builder_messages.append({"role": "user", "content": user_input})
     builder_messages.append({"role": "assistant", "content": json.dumps(data, ensure_ascii=False)})
-
     st.session_state["builder_messages"] = builder_messages
+
     return data
 
 
 def merge_draft(update: Dict[str, Any]) -> None:
     draft = st.session_state.get("agent_draft", {})
     for k, v in (update or {}).items():
-        # merge simple: si lista y ya existe lista, concat sin duplicar
         if isinstance(v, list) and isinstance(draft.get(k), list):
             seen = set(draft[k])
             draft[k].extend([x for x in v if x not in seen])
@@ -251,6 +282,7 @@ def page_home():
             with c1:
                 if st.button("💬 Abrir chat", use_container_width=True):
                     goto("chat")
+                    st.rerun()
             with c2:
                 if st.button("✏️ Duplicar (rápido)", use_container_width=True):
                     new_agent = dict(selected)
@@ -264,7 +296,6 @@ def page_home():
     with col2:
         st.subheader("Crear")
         if st.button("➕ Crear agente personalizado", use_container_width=True):
-            # reset creator state
             st.session_state["builder_messages"] = []
             st.session_state["agent_draft"] = {"language": "es"}
             st.session_state["agent_ready"] = False
@@ -285,18 +316,15 @@ def page_creator():
         goto("home")
         st.rerun()
 
-    # Si es la primera vez, lanzamos una pregunta inicial sin que el user escriba
     if not st.session_state["builder_messages"]:
         first = builder_step("Empecemos. Hazme la primera pregunta para definir el agente.")
         merge_draft(first.get("draft_update", {}))
         st.session_state["agent_ready"] = bool(first.get("done", False))
         st.session_state["built_system_prompt"] = first.get("system_prompt", "") or ""
 
-    # Mostrar borrador
     with st.expander("📄 Borrador actual", expanded=False):
         st.json(st.session_state.get("agent_draft", {}))
 
-    # Mostrar “chat” del builder (render simple)
     st.subheader("Conversación con el Builder")
     for msg in st.session_state["builder_messages"]:
         if msg["role"] == "assistant":
@@ -305,7 +333,6 @@ def page_creator():
         else:
             st.chat_message("user").write(msg["content"])
 
-    # Si ya está listo, preview + save
     if st.session_state.get("agent_ready") and st.session_state.get("built_system_prompt"):
         st.success("Agente listo para guardar.")
         st.subheader("System prompt generado")
@@ -336,10 +363,8 @@ def page_creator():
                 st.session_state["agent_ready"] = False
                 st.session_state["built_system_prompt"] = ""
                 st.rerun()
-
         return
 
-    # Input del usuario para el builder
     user_text = st.chat_input("Responde al Builder…")
     if user_text:
         data = builder_step(user_text)
@@ -372,13 +397,11 @@ def page_chat():
             st.rerun()
         return
 
-    # Selector de agente
     options = {f'{a.get("name","(sin nombre)")} — {a.get("description","")[:60]}': a["id"] for a in agents}
     default_id = st.session_state.get("selected_agent_id") or list(options.values())[0]
     labels = list(options.keys())
     ids = list(options.values())
 
-    # índice por defecto
     try:
         default_index = ids.index(default_id)
     except ValueError:
@@ -390,12 +413,10 @@ def page_chat():
 
     agent = next(a for a in agents if a["id"] == agent_id)
 
-    # historial por agente
     histories = st.session_state["chat_histories"]
     histories.setdefault(agent_id, [])
     history = histories[agent_id]
 
-    # Controles
     col1, col2, col3 = st.columns([2, 1, 1], vertical_alignment="bottom")
     with col1:
         st.caption(f"Modelo: {agent.get('model', DEFAULT_CHAT_MODEL)} | Temp: {agent.get('temperature', 0.7)}")
@@ -407,7 +428,6 @@ def page_chat():
         with st.popover("⚙️ Ver system prompt"):
             st.code(agent.get("system_prompt", ""), language="text")
 
-    # Render chat
     for msg in history:
         st.chat_message(msg["role"]).write(msg["content"])
 
@@ -415,9 +435,7 @@ def page_chat():
     if user_text:
         history.append({"role": "user", "content": user_text})
 
-        # Construimos mensajes para OpenAI
         messages = [{"role": "system", "content": agent.get("system_prompt", "")}] + history[-30:]
-
         answer = call_responses(
             model=agent.get("model", DEFAULT_CHAT_MODEL),
             messages=messages,
@@ -437,11 +455,7 @@ def page_chat():
 # =========================
 def main():
     init_state()
-
-    # Check API key early (mensaje bonito)
-    if not os.getenv("OPENAI_API_KEY"):
-        st.error("Falta OPENAI_API_KEY en tu entorno. Exporta la variable y reinicia `streamlit run app.py`.")
-        st.stop()
+    check_access()
 
     page = st.session_state.get("page", "home")
 
